@@ -30,8 +30,9 @@ for patch in "$here"/impossible-patches/*.patch; do
 	git -C "$src" apply "$patch"
 done
 
+# Both architectures, as the Simulator runs apps as the Mac's own.
 xcrun -sdk iphonesimulator clang -dynamiclib -fobjc-arc -fmodules \
-	-target arm64-apple-ios15.0-simulator \
+	-arch arm64 -arch x86_64 -mios-simulator-version-min=15.0 \
 	-I "$src/Sources/ImpossiBLE/include" -I "$src/Sources/ImpossiBLE" \
 	-framework Foundation -framework CoreBluetooth \
 	-install_name @rpath/libImpossiBLE.dylib \
