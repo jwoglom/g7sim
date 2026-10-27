@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: James Woglom <j@wogloms.net>
+Date: Tue, 27 Oct 2026 00:40:45 -0400
+Subject: [PATCH] Let the provider give a connection's ATT MTU
+
+On a device a write without response holds MTU-3 bytes, and CoreBluetooth
+cuts a longer one short without an error; an iPhone has negotiated an MTU
+of 185 with a Raspberry Pi pod, which cut OmnipodKit's 244-byte Omnipod 5
+packets. ImpossiBLE allowed 512 bytes always. A provider can now give the
+MTU in didConnect ("mtu"): maximumWriteValueLengthForType: answers MTU-3
+for a write without response, and a longer one is cut to that. A write
+with response, a long write on a device, stays at 512; without "mtu",
+nothing changes.
+---
+diff --git a/Sources/ImpossiBLE/CBSProxies.h b/Sources/ImpossiBLE/CBSProxies.h
+--- a/Sources/ImpossiBLE/CBSProxies.h
++++ b/Sources/ImpossiBLE/CBSProxies.h
+@@ -14,6 +14,7 @@
+ - (instancetype)initWithIdentifier:(NSUUID *)identifier name:(NSString *)name;
+ - (void)cbs_updateName:(NSString *)name;
+ - (void)cbs_setState:(CBPeripheralState)state;
++- (void)cbs_setMTU:(NSInteger)mtu;
+ - (void)readRSSI;
+ - (void)discoverServices:(NSArray<CBUUID *> *)serviceUUIDs;
+ - (void)discoverIncludedServices:(NSArray<CBUUID *> *)includedServiceUUIDs forService:(CBService *)service;
+diff --git a/Sources/ImpossiBLE/CBSProxies.m b/Sources/ImpossiBLE/CBSProxies.m
+--- a/Sources/ImpossiBLE/CBSProxies.m
++++ b/Sources/ImpossiBLE/CBSProxies.m
+@@ -28,6 +28,7 @@
+     id<CBPeripheralDelegate> _shimDelegate;
+     CBPeripheralState _shimState;
+     NSArray *_shimServices;
++    NSInteger _shimMTU; // the ATT MTU the provider gave on connecting, 0 for none
+ }
+ 
+ - (instancetype)initWithIdentifier:(NSUUID *)identifier name:(NSString *)name {
+@@ -54,6 +55,10 @@
+     _shimName = [name copy];
+ }
+ 
++- (void)cbs_setMTU:(NSInteger)mtu {
++    _shimMTU = mtu;
++}
++
+ - (void)cbs_setState:(CBPeripheralState)state {
+     _shimState = state;
+     // As in CoreBluetooth, a disconnect ends every subscription and forgets
+@@ -148,6 +153,11 @@
+     if (!chr || !chr.shimId) {
+         return;
+     }
++    // CoreBluetooth cuts a write without response to MTU-3 bytes, silently.
++    NSInteger max = [self maximumWriteValueLengthForType:type];
++    if (type == CBCharacteristicWriteWithoutResponse && (NSInteger)data.length > max) {
++        data = [data subdataWithRange:NSMakeRange(0, (NSUInteger)max)];
++    }
+     NSString *b64 = data ? [data base64EncodedStringWithOptions:0] : @"";
+     CBSConnectionSend(@{
+         @"type": @"write",
+@@ -193,7 +203,11 @@
+ }
+ 
+ - (NSInteger)maximumWriteValueLengthForType:(CBCharacteristicWriteType)type {
+-    (void)type;
++    // With an MTU from the provider, a write without response holds MTU-3
++    // bytes, as on a device; one with response is a long write, up to 512.
++    if (type == CBCharacteristicWriteWithoutResponse && _shimMTU > 3) {
++        return MIN(_shimMTU - 3, 512);
++    }
+     return 512;
+ }
+ 
+@@ -391,6 +405,7 @@
+ - (instancetype)initWithIdentifier:(NSUUID *)identifier name:(NSString *)name { return nil; }
+ - (void)cbs_updateName:(NSString *)name {}
+ - (void)cbs_setState:(CBPeripheralState)state {}
++- (void)cbs_setMTU:(NSInteger)mtu {}
+ - (void)readRSSI {}
+ - (void)discoverServices:(NSArray<CBUUID *> *)serviceUUIDs {}
+ - (void)discoverIncludedServices:(NSArray<CBUUID *> *)includedServiceUUIDs forService:(CBService *)service {}
+diff --git a/Sources/ImpossiBLE/CBSActivator.m b/Sources/ImpossiBLE/CBSActivator.m
+--- a/Sources/ImpossiBLE/CBSActivator.m
++++ b/Sources/ImpossiBLE/CBSActivator.m
+@@ -972,8 +972,15 @@
+             return;
+         }
+         CBPeripheralState newState = [type isEqualToString:@"didConnect"] ? CBPeripheralStateConnected : CBPeripheralStateDisconnected;
++        // A provider can give the connection's ATT MTU, to stand for a device
++        // that negotiated a small one; without it, writes are not limited.
++        NSNumber *mtuNum = msg[@"mtu"];
++        NSInteger mtu = [mtuNum isKindOfClass:[NSNumber class]] ? mtuNum.integerValue : 0;
+         for (CBSPeripheral *p in cbs_all_peripherals_for_uuid(uuid)) {
+             [p cbs_setState:newState];
++            if (newState == CBPeripheralStateConnected) {
++                [p cbs_setMTU:mtu];
++            }
+         }
+         dispatch_queue_t queue = cbs_callback_queue_for_central(central);
+         CBPeripheral *cbPeripheral = (CBPeripheral *)peripheral;
